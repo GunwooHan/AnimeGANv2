@@ -1,0 +1,1 @@
+from .animeganv2 import PlAnimeGANv2

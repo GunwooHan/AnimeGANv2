@@ -1,0 +1,8 @@
+# conda install pytorch torchvision torchaudio cudatoolkit=11.3 -c pytorch -y
+wandb
+adamp
+tqdm
+opencv-python
+matplotlib
+pytorch_lightning
+lpips
