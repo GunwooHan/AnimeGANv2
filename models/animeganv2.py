@@ -4,15 +4,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from torchmetrics.image import FrechetInceptionDistance
+from torch.autograd import Variable
+
 
 class PlAnimeGANv2(pl.LightningModule):
     def __init__(self, args=None):
         super(PlAnimeGANv2, self).__init__()
         self.args = args
         self.generator = Generator()
-        self.discriminator = Discriminator()
-        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg')
-
+        self.discriminator = SPNormDiscriminator()
+        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True)
+        self.fid = FrechetInceptionDistance(reset_real_features=False, normalize=True)
 
     def forward(self, tensor):
         x = self.model(tensor)
@@ -24,6 +27,9 @@ class PlAnimeGANv2(pl.LightningModule):
     def l2_loss(self, x, y):
         return F.mse_loss(x, y)
 
+    def l1_loss(self, x, y):
+        return F.l1_loss(x, y)
+
     def perceptual_loss(self, x, y):
         return self.lpips(x, y)
 
@@ -31,45 +37,115 @@ class PlAnimeGANv2(pl.LightningModule):
         src_image, tgt_image = train_batch
 
         if optimizer_idx == 0:
-            self.generated_imgs = self.generator(src_image)
+            gen_image = self.generator(src_image)
 
-            grid = torchvision.utils.make_grid(torch.cat([src_image[:6], self.generated_imgs[:6], tgt_image[:6]]),
-                                               nrow=src_image.size(0) if src_image.size(0) < 6 else 6)
-            self.logger.log_image("generated_images", [grid])
+            if batch_idx == 0:
+                grid = torchvision.utils.make_grid(torch.cat([src_image[:6], gen_image[:6], tgt_image[:6]]),
+                                                   nrow=src_image.size(0) if src_image.size(0) < 6 else 6)
+                self.logger.log_image("generated_images", [grid])
 
-            valid = torch.ones(src_image.size(0), 1)
-            valid = valid.type_as(src_image)
+            g_loss_value = -torch.mean(self.discriminator(gen_image))
+            perceptual_loss_value = self.perceptual_loss(gen_image, tgt_image)
+            l1_loss_value = self.l1_loss(gen_image, tgt_image)
 
-            g_loss_value = self.adversarial_loss(self.discriminator(self.generated_imgs), valid)
-            perceptual_loss_value = self.perceptual_loss(self.generated_imgs, tgt_image)
-            l2_loss_value = self.l2_loss(self.generated_imgs, tgt_image)
-
-            total_loss = g_loss_value * 0.1 + perceptual_loss_value + l2_loss_value
+            total_loss = g_loss_value * self.args.adv_weight + perceptual_loss_value * self.args.lpips_weight + \
+                         l1_loss_value * self.args.recon_weight
 
             self.log("train/g_loss", g_loss_value, prog_bar=True)
             self.log("train/perceptual_loss", perceptual_loss_value, prog_bar=True)
-            self.log("train/l2_loss", l2_loss_value, prog_bar=True)
+            self.log("train/l1_loss", l1_loss_value, prog_bar=True)
+
+            if self.current_epoch == 0:
+                self.fid.update(tgt_image, real=True)
+            self.fid.update(gen_image, real=False)
+
             return {'loss': total_loss}
 
         if optimizer_idx == 1:
-            valid = torch.ones(tgt_image.size(0), 1)
-            valid = valid.type_as(tgt_image)
+            gen_image = self.generator(src_image).detach()
+            feature_real = self.discriminator(tgt_image)
+            feature_fake = self.discriminator(gen_image)
 
-            real_loss = self.adversarial_loss(self.discriminator(tgt_image), valid)
+            fake_loss = - torch.mean(torch.min(-feature_fake - 1, torch.zeros_like(feature_fake)))
+            real_loss = - torch.mean(torch.min(feature_real - 1, torch.zeros_like(feature_real)))
+            gp_loss = self.gradient_panelty(self.discriminator, tgt_image, gen_image)
+            d_loss = (real_loss + fake_loss) / 2
 
-            fake = torch.zeros(src_image.size(0), 1)
-            fake = fake.type_as(src_image)
-
-            fake_loss = self.adversarial_loss(self.discriminator(self.generator(src_image).detach()), fake)
-
-            d_loss = (real_loss + fake_loss) / 2 * 0.1
             self.log("train/d_loss", d_loss, prog_bar=True)
-            return d_loss
+            self.log("train/gp_loss", gp_loss, prog_bar=True)
+            total_loss = d_loss * self.args.adv_weight + gp_loss * self.args.gp_weight
+            return total_loss
 
     def configure_optimizers(self):
         opt_g = torch.optim.Adam(self.generator.parameters(), lr=self.args.learning_rate)
         opt_d = torch.optim.Adam(self.discriminator.parameters(), lr=self.args.learning_rate)
         return [opt_g, opt_d]
+
+    def gradient_panelty(self, netD, target_image, result_images):
+        bs = result_images.shape[0]
+        alpha = torch.rand(bs, 1, 1, 1).expand_as(result_images).cuda()
+        interpolated = Variable(alpha * target_image +
+                                (1 - alpha) * result_images, requires_grad=True)
+        pred_interpolated = netD.forward(interpolated)
+        pred_interpolated = pred_interpolated[-1]
+
+        # compute gradients
+        grad = torch.autograd.grad(outputs=pred_interpolated,
+                                   inputs=interpolated,
+                                   grad_outputs=torch.ones(
+                                       pred_interpolated.size()).cuda(),
+                                   retain_graph=True,
+                                   create_graph=True,
+                                   only_inputs=True)[0]
+
+        # penalize gradients
+        grad = grad.view(grad.size(0), -1)
+        grad_l2norm = torch.sqrt(torch.sum(grad ** 2, dim=1))
+        loss_d_gp = torch.mean((grad_l2norm - 1) ** 2)
+
+        return loss_d_gp
+
+    def training_epoch_end(self, training_step_outputs):
+        fid_score = self.fid.compute()
+        self.log("train/fid_score", fid_score)
+        self.fid.reset()
+
+
+class UnetGenerator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
+        self.enc1 = ResBlock(32, 64)
+        self.enc2 = ResBlock(64, 128)
+        self.enc3 = ResBlock(128, 256)
+        self.enc3 = ResBlock(256, 128)
+        self.enc3 = ResBlock(128, 256)
+        self.enc3 = ResBlock(128, 256)
+
+    def forward(self, tensor):
+        pass
+
+
+class ResBlockBN(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=2, bias=False)
+
+    def forward(self, tensor):
+        x = self.conv1(tensor)
+        x = self.bn1(x)
+        x = F.leaky_relu(x, negative_slope=0.2) * (2 ** 0.5)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = F.leaky_relu(x, negative_slope=0.2) * (2 ** 0.5)
+
+        skip_x = self.skip(tensor)
+        return (x + skip_x) / (2 ** 0.5)
 
 
 class ConvNormLReLU(nn.Sequential):
@@ -152,7 +228,7 @@ class Generator(nn.Module):
 
         self.out_layer = nn.Sequential(
             nn.Conv2d(32, 3, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.Tanh()
+            nn.Sigmoid()
         )
 
     def forward(self, tensor, align_corners=True):
@@ -275,7 +351,7 @@ class SPNormDiscriminator(nn.Module):
             SPNormResBlock(512, 512),
         )
         self.final_conv = nn.Conv2d(512 + 1, 512, kernel_size=3, padding=1)
-        self.final_linear1 = nn.Linear(512 * 2 * 2, 512) # 해상도별 조절 필요
+        self.final_linear1 = nn.Linear(512 * 2 * 2, 512)  # 해상도별 조절 필요
         self.final_linear2 = nn.Linear(512, 1)
 
     def forward(self, tensor):
@@ -296,5 +372,11 @@ class SPNormDiscriminator(nn.Module):
         out = self.final_linear1(out)
         out = F.leaky_relu(out, negative_slope=0.2) * (2 ** 0.5)
         out = self.final_linear2(out)
-        out = torch.sigmoid(out)
+        # out = torch.sigmoid(out)
         return out
+
+
+if __name__ == '__main__':
+    from torchsummary import summary
+    model = Generator().cuda()
+    summary(model, (3, 256, 256))

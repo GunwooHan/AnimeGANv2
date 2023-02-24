@@ -19,17 +19,20 @@ parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--data_dir', type=str, default='datasets/arcane')
 
 # 모델 관련 설정
-parser.add_argument('--gpus', type=int, default=1)
+parser.add_argument('--gpus', type=int, default=4)
 parser.add_argument('--precision', type=int, default=32)
-parser.add_argument('--num_workers', type=int, default=8)
+parser.add_argument('--num_workers', type=int, default=16)
 parser.add_argument('--project', type=str, default='AnimeGanV2')
 parser.add_argument('--name', type=str, default='animeganv2')
 
 # 학습 관련 설정
-parser.add_argument('--epochs', type=int, default=5)
+parser.add_argument('--epochs', type=int, default=200)
 parser.add_argument('--batch_size', type=int, default=2)
 parser.add_argument('--learning_rate', type=float, default=0.0001)
-
+parser.add_argument('--adv_weight', type=float, default=0.5)
+parser.add_argument('--lpips_weight', type=float, default=1.0)
+parser.add_argument('--recon_weight', type=float, default=1.0)
+parser.add_argument('--gp_weight', type=float, default=0.00001)
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -40,14 +43,13 @@ if __name__ == '__main__':
     wandb_logger = WandbLogger(project=args.project, name=args.name)
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints",
-        filename='{epoch:04d}',
-        every_n_epochs=10
+        monitor="train/fid_score",
+        filename='{train/fid_score:.2f}',
     )
 
     transform = torchvision.transforms.Compose([
         torchvision.transforms.Resize(256),
         torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
 
     model = PlAnimeGANv2(args)
@@ -61,13 +63,14 @@ if __name__ == '__main__':
                          devices=args.gpus,
                          precision=args.precision,
                          max_epochs=args.epochs,
-                         log_every_n_steps=1,
-                         # strategy='ddp',
+                         # log_every_n_steps=1,
+                         strategy='ddp',
                          # num_sanity_val_steps=0,
                          # limit_train_batches=5,
                          # limit_val_batches=1,
                          logger=wandb_logger,
-                         callbacks=[checkpoint_callback])
+                         # callbacks=[checkpoint_callback],
+                         )
 
     trainer.fit(model, train_dataloaders=train_dataloader)
     wandb.finish()
