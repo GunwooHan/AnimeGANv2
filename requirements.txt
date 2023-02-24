@@ -6,3 +6,4 @@ opencv-python
 matplotlib
 pytorch_lightning
 lpips
+torchmetrics[image]
